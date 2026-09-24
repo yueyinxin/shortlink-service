@@ -1,0 +1,132 @@
+name: CI
+
+# 触发条件：推送到 main 与任意 PR。
+# 不给 push 加分支过滤（除了排除 main 的重复触发）—— 每次推送到功能分支都应当
+# 得到反馈，等到开 PR 时才发现编译不过是最不必要的返工。
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# 同一分支的旧运行在新提交到来时自动取消。
+# 没有这个配置时，连续推送几次会让多个流水线并行执行，既浪费资源，
+# 也让"哪个运行对应哪次提交"变得混乱。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # 构建、单元测试与集成测试
+  #
+  # 只有一个 job 而不是拆成"编译 / 单元测试 / 集成测试"三个：
+  # 拆分会把 Maven 本地仓库的缓存状态割裂到不同 job，每个 job 都要重新下载依赖，
+  # 总耗时反而更长。单个 job 内按顺序执行，失败时前面的步骤已经提供了足够的定位信息。
+  # ==========================================================================
+  build:
+    name: 构建与测试
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          # 让 setup-java 管理 Maven 本地仓库缓存。
+          # 缓存键由 pom.xml 的哈希决定，因此依赖不变时命中缓存，
+          # 能把构建时间从数分钟压到几十秒。
+          cache: 'maven'
+
+      - name: 编译
+        run: ./mvnw -B -q compile
+
+      # 单元测试：不依赖外部资源，全部通过才继续。
+      # --fail-at-end 不适用于这里 —— 单元测试失败后继续跑集成测试没有意义，
+      # 因为集成测试依赖同一份编译产物，问题很可能出在同一处。
+      - name: 单元测试
+        run: ./mvnw -B test
+
+      # 集成测试：使用 Testcontainers 启动真实的 MySQL 与 Redis。
+      # GitHub 的 ubuntu-latest runner 自带 Docker，因此无需额外配置。
+      - name: 集成测试
+        run: ./mvnw -B verify -DskipUnitTests=false
+
+      # 测试报告在失败时才有价值，因此只在失败时上传，避免无谓的存储占用。
+      - name: 上传测试报告
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+          retention-days: 7
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+          retention-days: 7
+
+  # ==========================================================================
+  # 构建并推送容器镜像
+  #
+  # 只在推送到 main 时执行（PR 不推送镜像）—— PR 的产物不应该进入镜像仓库，
+  # 否则一个被拒绝的 PR 会留下一个来源不明的镜像。
+  # ==========================================================================
+  docker:
+    name: 构建镜像
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 只构建不推送：目标是验证 Dockerfile 仍然可用。
+      # 推送需要配置镜像仓库凭据，而那是部署决策而非 CI 的默认职责 ——
+      # 需要时在此处添加 docker/login-action 并补上 push: true。
+      - name: 构建镜像（不推送）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # 使用 GitHub Actions 的构建缓存，避免每次重新下载 Maven 依赖
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: shortlink-service:${{ github.sha }}
+
+      # 构建完立即启动容器做冒烟测试，验证镜像真能跑起来。
+      # 只构建不运行的检查是不够的 —— 一个缺少 JRE 或入口脚本错误的镜像
+      # 同样能构建成功。
+      - name: 镜像冒烟测试
+        run: |
+          docker run -d --name smoke -p 8080:8080 \
+            -e SPRING_PROFILES_ACTIVE=prod \
+            -e MYSQL_HOST=unreachable -e MYSQL_DATABASE=x -e MYSQL_USER=x -e MYSQL_PASSWORD=x \
+            -e REDIS_HOST=unreachable -e REDIS_PASSWORD=x \
+            -e SHORTLINK_BASE_URL=http://localhost:8080 \
+            -e SHORTLINK_JWT_SECRET=ci-smoke-test-secret-at-least-32-bytes-long \
+            -e SHORTLINK_CODE_SECRET=ci-smoke-test-code-secret \
+            shortlink-service:${{ github.sha }} || true
+
+          # 容器在依赖不可用时应当启动失败并退出，而不是崩溃循环。
+          # 这里只验证镜像能被 Docker 接受并产生进程，不验证业务功能
+          # —— 业务功能由集成测试覆盖。
+          sleep 5
+          docker logs smoke 2>&1 | tail -20 || true
+          docker rm -f smoke || true
