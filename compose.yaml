@@ -1,0 +1,85 @@
+# =============================================================================
+# 本地开发用的基础设施编排
+#
+# 只启动 MySQL 与 Redis，应用本身从 IDE 或命令行运行（便于断点调试）。
+# 完整部署编排见 deploy/compose.prod.yaml。
+#
+#   docker compose up -d          启动
+#   docker compose ps             查看健康状态
+#   docker compose down           停止（保留数据）
+#   docker compose down -v        停止并删除数据卷
+# =============================================================================
+
+name: shortlink
+
+services:
+  mysql:
+    # 固定 8.0 大版本而不是 mysql:latest。
+    # latest 会在某天变成 9.x，届时字符集默认值、SQL 模式都可能变化，
+    # 让「昨天还能跑」的本地环境突然失败。生产环境应进一步固定到补丁版本。
+    image: mysql:8.0
+    container_name: shortlink-mysql
+    restart: unless-stopped
+    environment:
+      # 密码优先从环境变量读取，未设置时回退到开发默认值。
+      # 生产环境必须通过环境变量覆盖 —— 这里的默认值只用于本机开发。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_pw}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-shortlink}
+      MYSQL_USER: ${MYSQL_USER:-shortlink}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-shortlink_dev_pw}
+    command:
+      # 字符集与排序规则显式指定，避免因镜像版本变动导致排序规则漂移。
+      # 注意：短码列的大小写敏感排序规则（utf8mb4_bin）由建表语句单独指定，
+      # 不依赖这里的服务器默认值。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # 固定时区。不固定的话，MySQL 容器默认 UTC 而应用默认东八区，
+      # 会让写入与读取的时间相差 8 小时 —— 这是 Java + MySQL 最常见的线上事故之一。
+      - --default-time-zone=+08:00
+    ports:
+      # 绑定到 127.0.0.1 而非 0.0.0.0：开发数据库不应暴露在局域网上。
+      # 不加前缀的 "3306:3306" 会监听所有网卡。
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 用 mysqladmin ping 而不是 TCP 端口探测。
+      # 端口监听成功不代表数据库已完成初始化，后者会让应用在 MySQL 尚未就绪时
+      # 启动并因连接失败而退出（Flyway 迁移尤其敏感）。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: shortlink-redis
+    restart: unless-stopped
+    command:
+      # 开启 AOF 持久化。刷新令牌与未刷库的统计计数都在 Redis 中，
+      # 重启丢失会导致统计出现无法弥补的缺口、以及所有用户被迫重新登录。
+      - redis-server
+      - --appendonly
+      - "yes"
+      # everysec：每秒 fsync 一次。这是持久性与性能的平衡点，
+      # 最多丢失 1 秒数据，而 always 会让每次写都落盘，性能下降一个数量级。
+      - --appendfsync
+      - everysec
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  # 显式命名数据卷，避免不同项目目录下的 compose 项目互相干扰。
+  # 默认卷名会带上项目目录名前缀，一旦目录改名，数据就"消失"了。
+  mysql-data:
+    name: shortlink-mysql-data
+  redis-data:
+    name: shortlink-redis-data

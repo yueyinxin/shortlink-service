@@ -1,0 +1,215 @@
+# =============================================================================
+# shortlink-service 主配置
+#
+# 敏感项一律通过环境变量注入，形如 ${ENV_VAR:dev-default}。
+# 冒号后的部分是<b>仅供本机开发</b>的兜底值，生产环境必须通过环境变量覆盖 ——
+# 应用启动时会检查并拒绝在 prod profile 下使用这些开发默认值
+# （见 StartupSafetyCheck）。
+# =============================================================================
+
+spring:
+  application:
+    name: shortlink-service
+
+  # ---------------------------------------------------------------- 数据源
+  datasource:
+    # serverTimezone 必须显式指定：不指定时驱动会使用 JVM 默认时区去解释
+    # 服务器返回的时间，两端不一致会让时间相差 8 小时 ——
+    # 这是 Java + MySQL 组合最经典的线上事故。
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:shortlink}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf8&useUnicode=true&rewriteBatchedStatements=true
+    username: ${MYSQL_USER:shortlink}
+    password: ${MYSQL_PASSWORD:shortlink_dev_pw}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: shortlink-pool
+      # 连接池大小需要按实际负载调优。默认 10 意味着最多 10 个并发数据库操作，
+      # 超过的请求会排队等待。这个值必须 ≤ MySQL 的 max_connections，
+      # 且在多实例部署时是"每实例"的（4 个实例 × 10 = 40 个连接）。
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: 2
+      # 从池中获取连接的最长等待时间。设得短（3 秒）是有意的：
+      # 数据库过载时应当快速失败并返回 503，而不是让请求堆积直到全部超时 ——
+      # 后者会让故障从数据库蔓延到整个服务（雪崩）。
+      connection-timeout: 3000
+      max-lifetime: 1740000
+      keepalive-time: 300000
+
+  # ---------------------------------------------------------------- JPA
+  jpa:
+    # 必须设为 false。默认值 true 会让 Hibernate 在整个 HTTP 请求期间持有
+    # 一个数据库连接（用于按需触发懒加载），造成两个后果：
+    #   1) 连接池的有效容量被大幅削减，高并发下连接耗尽；
+    #   2) 掩盖 N+1 查询问题 —— 序列化阶段才发起的查询不会出现在慢日志里。
+    # 关闭后懒加载必须在事务内完成，这会强制代码显式处理加载边界，是正确的约束。
+    open-in-view: false
+    hibernate:
+      # 表结构由 Flyway 管理，Hibernate 只做校验。
+      # validate 会在启动时比对实体映射与真实表结构，任何不一致都立即失败 ——
+      # 这让"改了实体忘了写迁移脚本"这类错误在启动时就被拦住，而不是在线上
+      # 等到某个查询报"Unknown column"才发现。
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: Asia/Shanghai
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+        # 只在开发期打开 SQL 输出，生产环境由 logging 配置控制
+        show_sql: false
+
+  # ---------------------------------------------------------------- Flyway
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 不使用 baseline-on-migrate：它会在遇到非空库时跳过所有已存在的迁移，
+    # 让"表结构是否与迁移脚本一致"变得不可验证。干净部署 + 完整迁移才是可重复的。
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+  # ---------------------------------------------------------------- Redis
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DATABASE:0}
+      # 超时要短。Redis 的任何操作都在请求关键路径上（跳转查缓存、限流计数），
+      # 长超时会把 Redis 的故障放大成服务的整体不可用。
+      timeout: 2s
+      connect-timeout: 2s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 1s
+
+  jackson:
+    default-property-inclusion: non_null
+    deserialization:
+      fail-on-unknown-properties: false
+    time-zone: Asia/Shanghai
+
+  threads:
+    virtual:
+      # Java 17 没有虚拟线程（21 才引入），保持关闭。
+      # 显式写出是为了说明这是有意的选择，而不是遗漏。
+      enabled: false
+
+# =============================================================================
+# 业务配置
+# =============================================================================
+shortlink:
+  # 对外基础地址，用于拼接返回给客户端的完整短链
+  base-url: ${SHORTLINK_BASE_URL:http://localhost:8080}
+
+  code:
+    # 短码置换密钥。生产环境必须覆盖！
+    secret: ${SHORTLINK_CODE_SECRET:dev-only-code-secret-do-not-use-in-production}
+    length: 6
+
+  cache:
+    ttl: 24h
+    # 空值缓存显著短于正常 TTL，避免"刚创建就访问"的短链误报 404
+    null-ttl: 60s
+    # TTL 随机抖动 ±10%，防缓存雪崩
+    jitter-ratio: 0.1
+
+  rate-limit:
+    redirect-per-minute-per-ip: 300
+    create-per-minute-per-user: 30
+
+  stats:
+    # 多实例部署时应只在一个实例上开启，或引入分布式锁。见 StatsFlushScheduler 的类文档。
+    enabled: ${STATS_FLUSH_ENABLED:true}
+    # 刷库周期（毫秒）。决定了统计数据的最大滞后时间。
+    # 用毫秒数而不是 "60s"：不同 Spring 版本对 Duration 字符串的解析支持不一致，
+    # 纯数字消除了这个版本差异风险。
+    flush-interval-millis: ${STATS_FLUSH_INTERVAL_MILLIS:60000}
+    default-query-days: 7
+    max-query-days: 90
+
+  jwt:
+    # 至少 32 字节。生产环境必须覆盖！
+    secret: ${SHORTLINK_JWT_SECRET:dev-only-jwt-secret-do-not-use-in-production-min-32-bytes}
+    access-token-ttl: 30m
+    refresh-token-ttl: 14d
+    issuer: shortlink-service
+
+  security:
+    # 默认不信任转发头。若部署在 Nginx 之后，且 Nginx 用
+    # proxy_set_header X-Forwarded-For $remote_addr;（覆盖而非追加）时才能改为 true。
+    # 否则任何客户端都能伪造 IP 绕过限流。
+    trust-forwarded-headers: ${TRUST_FORWARDED_HEADERS:false}
+    public-actuator-endpoints: ${PUBLIC_ACTUATOR_ENDPOINTS:false}
+
+# =============================================================================
+# 可观测性
+# =============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露需要的端点。Actuator 的默认暴露面很宽，
+        # 其中 env / beans / heapdump 足以泄露配置、内部结构乃至内存中的密码。
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      # show-details 用 when-authorized 而非 always：
+      # 匿名请求只看到 UP/DOWN，运维人员认证后才能看到是哪个组件不可用。
+      # always 会暴露数据库地址、磁盘路径等信息。
+      show-details: when-authorized
+      probes:
+        enabled: true
+  health:
+    db:
+      enabled: true
+    redis:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      # 打开 HTTP 请求耗时的直方图，Prometheus 才能计算 P95/P99 分位数。
+      # 默认的摘要模式无法跨实例聚合，必须用直方图。
+      percentiles-histogram:
+        http.server.requests: true
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: shortlink-service
+    description: 短链接服务
+    version: @project.version@
+    java: @java.version@
+
+# =============================================================================
+# 接口文档
+# =============================================================================
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    # 按接口自动分组时保持稳定顺序，便于在 UI 中查找
+    display-request-duration: true
+
+# =============================================================================
+# 日志
+# =============================================================================
+logging:
+  level:
+    root: INFO
+    io.github.yueyinxin.shortlink: ${LOG_LEVEL_APP:INFO}
+    # 屏蔽 Hibernate 启动期的噪声日志，突出应用自身的输出
+    org.hibernate.SQL: ${LOG_LEVEL_SQL:WARN}
+    org.springframework.web: WARN
+  pattern:
+    # 在每行日志中带上 traceId，便于把一个请求产生的所有日志串起来。
+    # 没有它，排查线上问题只能在时间轴上猜。traceId 由 TraceIdFilter 写入 MDC。
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{traceId:-}] %logger{36} - %msg%n"

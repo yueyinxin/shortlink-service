@@ -1,0 +1,101 @@
+# =============================================================================
+# 生产环境配置（激活方式：SPRING_PROFILES_ACTIVE=prod）
+#
+# 本文件中的所有敏感项【没有默认值】—— 形如 ${VAR} 而非 ${VAR:default}。
+# 未设置环境变量时，应用会在启动阶段因无法绑定配置而失败。
+# 这是刻意的：生产环境缺少必要配置应当立刻失败，而不是带着错误的默认值运行。
+#
+# 此外，StartupSafetyCheck 会进一步拦截"使用了开发默认值"的情况
+# （当运维误用 dev 配置启动 prod profile 时）。
+# =============================================================================
+
+spring:
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST}:${MYSQL_PORT:3306}/${MYSQL_DATABASE}?useSSL=${MYSQL_USE_SSL:true}&allowPublicKeyRetrieval=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&useUnicode=true&rewriteBatchedStatements=true&connectTimeout=5000&socketTimeout=30000
+    username: ${MYSQL_USER}
+    password: ${MYSQL_PASSWORD}
+    hikari:
+      # 生产环境给足连接数。注意这是【每实例】的值 ——
+      # 实例数 × maximum-pool-size 必须小于 MySQL 的 max_connections，
+      # 否则会出现实例拿到数据库连接失败的情况。
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 5
+
+  jpa:
+    properties:
+      hibernate:
+        # 生产环境不打印 SQL。打开 SQL 日志会带来两个问题：
+        # 一是日志量激增，二是慢查询日志被淹没，真正需要分析的语句反而找不到。
+        show_sql: false
+
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      database: ${REDIS_DATABASE:0}
+      timeout: 2s
+
+shortlink:
+  base-url: ${SHORTLINK_BASE_URL}
+  code:
+    secret: ${SHORTLINK_CODE_SECRET}
+    length: ${SHORTLINK_CODE_LENGTH:6}
+  cache:
+    ttl: ${SHORTLINK_CACHE_TTL:24h}
+    null-ttl: ${SHORTLINK_CACHE_NULL_TTL:60s}
+    jitter-ratio: 0.1
+  rate-limit:
+    # 生产环境的阈值应结合压测结果调整，这里的值是基于单实例 1000 QPS 目标的估计
+    redirect-per-minute-per-ip: ${RATE_LIMIT_REDIRECT:600}
+    create-per-minute-per-user: ${RATE_LIMIT_CREATE:30}
+  stats:
+    # 多实例部署时应只在一个实例上开启（见 StatsFlushScheduler 的类文档）
+    enabled: ${STATS_FLUSH_ENABLED:true}
+    flush-interval-millis: ${STATS_FLUSH_INTERVAL_MILLIS:60000}
+    default-query-days: 7
+    max-query-days: 90
+  jwt:
+    secret: ${SHORTLINK_JWT_SECRET}
+    # 生产环境缩短访问令牌有效期，压缩令牌泄露后的损失窗口。
+    # 代价是客户端刷新更频繁 —— 这是安全的必要成本。
+    access-token-ttl: ${JWT_ACCESS_TTL:15m}
+    refresh-token-ttl: ${JWT_REFRESH_TTL:7d}
+    issuer: ${JWT_ISSUER:shortlink-service}
+  security:
+    trust-forwarded-headers: ${TRUST_FORWARDED_HEADERS:true}
+    public-actuator-endpoints: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # 生产环境只暴露必要端点。actuator 的默认暴露面很宽，
+        # 其中 env / beans / heapdump 足以泄露配置、内部结构乃至内存中的凭证。
+        include: health,prometheus
+  endpoint:
+    health:
+      # 只对已认证的请求展示组件明细。always 会把数据库地址、磁盘路径
+      # 一并暴露给任何能访问该端点的人。
+      show-details: when-authorized
+      show-components: when-authorized
+
+# 生产环境关闭接口文档。Swagger UI 会完整暴露接口结构、参数与错误码，
+# 相当于给攻击者一份免费的漏洞测绘报告。若确需保留，
+# 应通过网关限制其访问来源而非直接公开。
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+logging:
+  level:
+    root: WARN
+    io.github.yueyinxin.shortlink: INFO
+    org.hibernate.SQL: WARN
+  # 生产环境输出到文件，便于日志采集器（Filebeat / Promtail）收集。
+  # 容器化部署时通常不需要写文件（stdout 由容器运行时收集），
+  # 因此这里默认仍为控制台输出，需要时通过环境变量覆盖 LOGGING_FILE_NAME。
+  file:
+    name: ${LOGGING_FILE_NAME:}
