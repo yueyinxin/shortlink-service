@@ -1,0 +1,147 @@
+# =============================================================================
+# 生产部署编排
+#
+# 使用方式：
+#   1. 复制 deploy/.env.example 为 deploy/.env 并填入真实值
+#   2. docker compose -f deploy/compose.prod.yaml --env-file deploy/.env up -d
+#
+# 与根目录的 compose.yaml 的区别：那个只启动基础设施（本地开发用，应用从 IDE 运行），
+# 这个启动完整栈（应用 + MySQL + Redis），供服务器部署使用。
+# =============================================================================
+
+name: shortlink-prod
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: shortlink-prod-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?必须设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?必须设置 MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER:?必须设置 MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?必须设置 MYSQL_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      # 生产环境限制单条 SQL 的最大执行时间。没有这个限制时，一条失控的慢查询
+      # 会占住连接直到超时，在连接池被占满后导致整个服务不可用。
+      # 这里设为 10 秒 —— 本项目的查询都应当是索引命中的快速查询。
+      - --max-execution-time=10000
+      - --slow-query-log=1
+      - --long-query-time=1
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    # 不暴露端口。只有同一 compose 网络中的应用需要访问它，
+    # 映射到宿主机等于把一个只需内网访问的数据库暴露给整个网络。
+    # 需要运维排查时用 docker compose exec mysql mysql -u... 进入。
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    container_name: shortlink-prod-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --requirepass
+      - ${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}
+      # 设置 Redis 的最大内存与淘汰策略。
+      # allkeys-lru：内存达到上限时淘汰最近最少使用的键。
+      # 本服务缓存的都是可重建的数据（短链缓存、统计计数），因此淘汰是安全的。
+      # 注意：绝不能使用 noeviction —— 那会让写入直接失败，
+      # 表现为跳转可用但无法记录统计。
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  app:
+    image: ${APP_IMAGE:-shortlink-service:latest}
+    container_name: shortlink-prod-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # ---- 数据库 ----
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      # ---- Redis ----
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # ---- 密钥（应用启动时会校验其长度与是否为开发默认值）----
+      SHORTLINK_JWT_SECRET: ${SHORTLINK_JWT_SECRET:?必须设置 SHORTLINK_JWT_SECRET}
+      SHORTLINK_CODE_SECRET: ${SHORTLINK_CODE_SECRET:?必须设置 SHORTLINK_CODE_SECRET}
+      # ---- 对外地址 ----
+      SHORTLINK_BASE_URL: ${SHORTLINK_BASE_URL:?必须设置 SHORTLINK_BASE_URL}
+      # 应用部署在反向代理之后，需要信任转发头才能拿到真实客户端 IP。
+      # 前提是代理会覆盖（而非追加）X-Forwarded-For，否则限流可被绕过。
+      TRUST_FORWARDED_HEADERS: ${TRUST_FORWARDED_HEADERS:-false}
+      # ---- 统计刷库 ----
+      STATS_FLUSH_ENABLED: ${STATS_FLUSH_ENABLED:-true}
+      # ---- JVM ----
+      JAVA_OPTS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    ports:
+      # 只绑定回环地址：外部流量必须经过反向代理（Nginx/Caddy）进入，
+      # 由代理负责 TLS 终止、限流与访问日志。直接暴露应用端口会绕过这一层。
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 90s
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+volumes:
+  mysql-data:
+    name: shortlink-prod-mysql-data
+  redis-data:
+    name: shortlink-prod-redis-data
+
+networks:
+  backend:
+    name: shortlink-prod-network
+    driver: bridge
