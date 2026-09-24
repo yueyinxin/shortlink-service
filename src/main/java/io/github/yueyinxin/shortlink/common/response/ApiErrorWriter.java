@@ -1,6 +1,6 @@
 package io.github.yueyinxin.shortlink.common.response;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import io.github.yueyinxin.shortlink.common.exception.ErrorCode;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -8,7 +8,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -54,7 +53,11 @@ public class ApiErrorWriter {
         ApiResponse<Void> body = ApiResponse.error(errorCode, message, null, null);
         try {
             objectMapper.writeValue(response.getOutputStream(), body);
-        } catch (IOException e) {
+        } catch (Exception e) {
+            // Jackson 3 的异常体系是不受检的（JacksonException extends RuntimeException），
+            // 且不同版本对方法签名是否声明 throws 的处理不一致。
+            // 统一捕获 Exception，避免把"写错误响应失败"这件事变成一个未处理异常 ——
+            // 在错误处理路径上再抛异常，只会把一个可解释的失败变成不可解释的 500。
             log.error("写出错误响应失败: code={}", errorCode, e);
         }
     }

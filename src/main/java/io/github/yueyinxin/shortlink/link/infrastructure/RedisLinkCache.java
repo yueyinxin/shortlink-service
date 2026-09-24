@@ -1,6 +1,6 @@
 package io.github.yueyinxin.shortlink.link.infrastructure;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import io.github.yueyinxin.shortlink.config.properties.ShortLinkProperties;
 import io.github.yueyinxin.shortlink.link.LinkCache;
 import io.github.yueyinxin.shortlink.link.LinkSnapshot;
