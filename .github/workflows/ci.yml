@@ -45,7 +45,29 @@ jobs:
           # 能把构建时间从数分钟压到几十秒。
           cache: 'maven'
 
+      - name: 环境信息
+        # 保留这一步不只是为了本次排查。CI 环境与本地环境的差异是
+        # "本地能跑、CI 失败"这类问题最常见的根因，而 runner 镜像会随
+        # GitHub 的更新而变化。把工具版本记录下来，出问题时能立刻对比。
+        run: |
+          echo "=== 系统 ==="
+          uname -a
+          echo "=== 构建相关工具 ==="
+          for tool in wget curl unzip tar git; do
+            printf '%-8s' "$tool"
+            command -v "$tool" >/dev/null 2>&1 && { command -v "$tool"; "$tool" --version 2>&1 | head -1; } || echo "缺失"
+          done
+          echo "=== 到 Maven 中央仓库的连通性（用 curl 验证）==="
+          curl -sS -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' \
+            --max-time 30 \
+            https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.zip \
+            || echo "curl 也无法访问"
+
       - name: 编译
+        # MVNW_VERBOSE 让 Maven Wrapper 输出它选择的下载工具与目标路径。
+        # 默认情况下它只打印失败信息，看不出它到底尝试了什么。
+        env:
+          MVNW_VERBOSE: 'true'
         run: ./mvnw -B -q compile
 
       # 单元测试：不依赖外部资源，全部通过才继续。
